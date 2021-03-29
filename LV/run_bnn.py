@@ -1,136 +1,172 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-from LV_model import loguniform_prior, simulator, lotka_volterra, newData
-from bnn_model import LVClassifier, sample_local, sample_local_2D, inBin
+from LV_model import uniform_prior, uniform_prior_dens, simulator, lotka_volterra, newData
+import logging, dask, scipy, pickle, absl, sklearn
+from bcnn_model import Regressor
+from sklearn.model_selection import train_test_split 
+from gaussian import Gaussian
 import numpy as np
 import pandas as pd
 import time
 
 
-
-
-def run_bnn(max_rounds=10,max_gen=10,Ndata=1000,seed=0, multi_dim=False, num_bins=10, thresh=0.0, verbose=False):
+def minmax_normalize(data, min_=None, max_=None, axis=0):
     """
-    Run the BNN for multiple rounds and multiple generations
-    
-    *param*
-    max_rounds: the number of rounds to run, i.e., new seeds.
-    max_gen:    the number of sequential, adaptive, generations.
-    Ndata:      max number of model simulations per generation.
-    seed:       random number seed
-    multi_dim:  solve marginal or cross-terms
-    num_bins:   binning of data
-    thresh:     cut-of when resampling.
+        min max normalize (0 - ~1) of scale given min_ and max_
+        data = data to be scales
+        min_ = lower scale
+        max_ = upper scale
+        axis = which numpy axis to adress the scaling.
     """
+    data_ = np.copy(data)
+    if min_ is None:        
+        min_ = np.min(data_,axis=axis)
+        min_ = np.expand_dims(min_,axis=0)
     
+    if max_ is None:
+        max_ = np.max(data_,axis=axis)
+        max_ = np.expand_dims(max_,axis=0)
+    
+    min_[np.where(min_ == max_)] = 0
+
+    return (data_ - min_) / (max_ - min_)
+
+def checkprior(theta):
+    """
+       If sample in theta is outside of prior, then remove it from the sample.
+       theta = random samples, shape:(N,3)
+    """
+    flag = uniform_prior_dens(theta) > 0
+    print(f'len(flag): {sum(flag)}')
+    print(f'total: {theta.shape}')
+
+    return theta[flag,:]
+
+def run_bnn(total_runs=10, num_rounds=6, num_data_per_round = 1000, num_monte_carlo=500, 
+                                                                    batch_size=128, 
+                                                                    ID='test', 
+                                                                    seed=None,
+                                                                    epochs=100,
+                                                                    correction=True,
+                                                                    agg_data=True,
+                                                                    infer_pdf=True):
     np.random.seed(seed)
+    save_folder = ID
+    Ndata = num_data_per_round # number of model samples
+    initial_prior = uniform_prior 
+    #initial_prior = triangle_prior
+    result_posterior = [] #store posterior samples per round
+    result_proposal_prior = [] #store m, S of gaussian proposal
+    store_time = [] # time per round without simulation
 
+    target_theta = np.log([[1.0,0.005, 1.0]])
+    target_ts = np.load('target_ts.npy') #Load the observation
+    notscaled = False
 
-    use_small = True # use smaller network arch.
-    samplePrior = loguniform_prior
+    try:
     
-    
+        for run in range(total_runs):
+            print(f'starting run {run}')
+            theta = []
+            theta_tot = []
+            proposals = []
+            data_tot = []
+            theta_tot = []
+            time_ticks = []
+            theta.append(initial_prior(Ndata))
+            retrain = False
+            min_ = None
+            max_ = None
 
-    target_ts = np.load('target_ts.npy')
-    
-    res_per_round = {'theta': [], 'theta_corrected': [], 'time': []}
-    for round_ in range(max_rounds):
-        print(f'round {round_+1} out of {max_rounds}')
-
-        theta = []
-        theta_corrected = []
-        theta.append(samplePrior(Ndata, True))
-        time_ticks = []
-
-        for i in range(max_gen):
-            print(f'gen {i+1} out of {max_gen}')            
-            time_begin = time.time()
-
-            # of the previous gen dataset, which ones can we re-use? Goal is to maximize 
-            # the number of datapoints available.
-            if i > 0:
-                data_ts_, data_thetas_ = inBin(data_ts, data_thetas, theta[i])
-
-            # generate new data
-            data_ts, data_thetas = newData(theta[i], toexp=True)
-
-            if i > 0:
-                data_ts = np.append(data_ts, data_ts_, axis=0)
-                data_thetas = np.append(data_thetas, data_thetas_, axis=0)
-
-            # saving not only the full parameter arrays THETA but also the ones that are 
-            # removed because of timeout signal. 
-            theta_corrected.append(data_thetas)
-
-            # Classify new data
-            lv_c = LVClassifier(name_id=f'lv_{i}', seed=0)
-
-            lv_c.train_thetas = data_thetas
-            lv_c.train_ts = lv_c.reshape_data(data_ts)
-
-            #if multi_dim:
-            #    num_bins = 5
-            #else:
-            #    num_bins = 10
+            for i in range(num_rounds):
                 
-            lv_c.run(target=target_ts, num_bins=num_bins, batch_size=128, split=True, toload=False,
-                     verbose=verbose, use_small=use_small, multi_dim=multi_dim)
+                print(f'starting round {i}')
 
-            # save model for evaluation
-            #lv_c.model1.save(f'lv_gen{i}_model1')
-            #lv_c.model2.save(f'lv_gen{i}_model2')
-            #lv_c.model3.save(f'lv_gen{i}_model3')
+                # generate new data
+                if len(theta[i] > 0):
+                    data_ts, data_thetas = newData(theta[i], toexp=True)
+                    data_ts = np.transpose(data_ts, (0,2,1))
+                    if min_ is None:
+                        min_ = np.min(data_ts,axis=0)
+                        min_ = np.expand_dims(min_,axis=0)
+                    if max_ is None:
+                        max_ = np.max(data_ts,axis=0)
+                        max_ = np.expand_dims(max_,axis=0)
+                    if not notscaled:
+                        target_ts = minmax_normalize(target_ts,min_,max_)
+                        notscaled = True
+                    
+                    
+                    print(f'new data shape: {data_ts.shape}')
+                    if agg_data:
+                        data_tot.append(minmax_normalize(data_ts,min_,max_))
+                        #data_tot.append(np.transpose(data_ts, (0,2,1)))
+                                    
 
-            # resample
-            if multi_dim:
-                new_rate1, new_bins1 = sample_local_2D(lv_c.probs1, lv_c.multidim_bins_rate12, num_samples=Ndata, use_thresh=True, thresh=thresh)
-                new_rate2, new_bins2 = sample_local_2D(lv_c.probs2, lv_c.multidim_bins_rate13, num_samples=Ndata, use_thresh=True, thresh=thresh)
-                new_rate3, new_bins3 = sample_local_2D(lv_c.probs3, lv_c.multidim_bins_rate23, num_samples=Ndata, use_thresh=True, thresh=thresh)
-            
-                rate1 = np.hstack([new_rate1[:,0], new_rate2[:,0]])
-                rate1_ = np.random.choice(rate1, Ndata) # we only need Ndata samples.
-                rate2 = np.hstack([new_rate1[:,1], new_rate3[:,0]])
-                rate2_ = np.random.choice(rate2, Ndata)
-                rate3 = np.hstack([new_rate2[:,1], new_rate3[:,1]])
-                rate3_ = np.random.choice(rate3, Ndata)
-                new_rate_all = np.vstack([rate1_,rate2_,rate3_]).T
-            else:
-                new_rate1, new_bins1 = sample_local(lv_c.probs1, lv_c.bins_rate1, num_samples=Ndata, use_thresh=True, thresh=thresh)
-                new_rate2, new_bins2 = sample_local(lv_c.probs2, lv_c.bins_rate2, num_samples=Ndata, use_thresh=True, thresh=thresh)
-                new_rate3, new_bins3 = sample_local(lv_c.probs3, lv_c.bins_rate3, num_samples=Ndata, use_thresh=True, thresh=thresh)
-                new_rate_all = np.vstack((new_rate1,new_rate2,new_rate3)).T
-            theta.append(new_rate_all)
-           
-        
-            time_ticks.append(time.time() - time_begin)
-            
-        res_per_round['theta'].append(theta)
-        res_per_round['theta_corrected'].append(theta_corrected)
-        res_per_round['time'].append(time_ticks)
+                        theta_tot.append(data_thetas)
+  
+                print(f'tot theta shape: {np.concatenate(theta_tot, axis=0).shape}')
+                print(f'tot data shape: {np.concatenate(data_tot, axis=0).shape}')
 
-    print('*** DONE ***')
-    return res_per_round
+                # retrain model after first initial training
+                if i > 0:
+                    retrain = True
+                else:
+                    model = Regressor(name_id=f'lv_{i}')
+                
+                if agg_data:
+                    model.train_ts, model.val_ts, model.train_thetas, model.val_thetas = train_test_split(np.concatenate(data_tot, axis=0),
+                                                                                                        np.concatenate(theta_tot, axis=0), 
+                                                                                                        train_size=0.8, 
+                                                                                                        random_state=seed)
+                else:
+                    model.train_ts, model.val_ts, model.train_thetas, model.val_thetas = train_test_split(data_ts,
+                                                                                                        theta[i], 
+                                                                                                        train_size=0.8, 
+                                                                                                        random_state=seed)
+                # start inference
+                time_begin = time.time()
+                model.run(target=target_ts,num_monte_carlo=num_monte_carlo, batch_size=batch_size, 
+                        verbose=False, epochs=epochs, infer_pdf=infer_pdf, retrain=retrain, pooling_len=3)
+
+                
+                est_normal = Gaussian(m=model.proposal_mean[0], S=model.proposal_covar[0] + 1e-7)
+                if correction:
+                    if i > 0:
+                        try:
+                            est_proposal_prior = est_normal.__div__(est_proposal_prior)
+                            est_proposal_prior.S += 1e-7
+                        except np.linalg.LinAlgError:
+                            print('Improper Gaussian, using previous proposal')
+                            pass
+                    else:
+                        est_proposal_prior = est_normal
+                else:
+                    est_proposal_prior = est_normal
+
+                samples = est_proposal_prior.gen(Ndata)
+                samples_= checkprior(samples)
+                theta.append(samples_)
+                proposals.append([est_proposal_prior.m, est_proposal_prior.S])
+                time_ticks.append(time.time() - time_begin)
+
+            result_posterior.append(theta)
+            result_proposal_prior.append(proposals)
+            store_time.append(time_ticks)
+        return np.array(result_posterior), result_proposal_prior, np.array(store_time)
+    except KeyboardInterrupt:        
+        return np.asarray(result_posterior), np.asarray(result_proposal_prior), np.asarray(store_time)
+    
 
 
 
-
-# test the effect of bins
 def bnn_experiment():
-    bnn_res_5 = run_bnn(max_rounds=5,max_gen=8,Ndata=1000,seed=0, multi_dim=True, num_bins=5,thresh=0.05)
-    np.save('bnn_res_5_5round_8gen_theta_thresh.npy',bnn_res_5['theta'])
-    np.save('bnn_res_5_5round_8gen_time_thresh.npy',bnn_res_5['time'])
+    bnn_res = run_bnn(total_runs=5,num_rounds=10,num_data_per_round=2_500,epochs=500,seed=0)
+    np.save('bnn_res_theta_5x10x2500.npy',bnn_res_5[0])
+    np.save('bnn_res_proposal_5x10x2500.npy',bnn_res_5[1])
+    np.save('bnn_res_time_5x10x2500.npy',bnn_res_5[2])
 
-    bnn_res_4 = run_bnn(max_rounds=5,max_gen=8,Ndata=1000,seed=0, multi_dim=True, num_bins=4,thresh=0.05)
-    np.save('bnn_res_4_5round_8gen_theta_thresh.npy',bnn_res_4['theta'])
-    np.save('bnn_res_4_5round_8gen_time_thresh.npy',bnn_res_4['time'])
-
-    bnn_res_3 = run_bnn(max_rounds=5,max_gen=8,Ndata=1000,seed=0, multi_dim=True, num_bins=3,thresh=0.05)
-    np.save('bnn_res_3_5round_8gen_theta_thresh.npy',bnn_res_3['theta'])
-    np.save('bnn_res_3_5round_8gen_time_thresh.npy',bnn_res_3['time'])
-
-    bnn_res_5_not = run_bnn(max_rounds=5,max_gen=8,Ndata=1000,seed=0, multi_dim=True, num_bins=5,thresh=0.0)
-    np.save('bnn_res_5_5round_8gen_theta.npy',bnn_res_5_not['theta'])
-    np.save('bnn_res_5_5round_8gen_time.npy',bnn_res_5_not['time'])
+    
 
 
