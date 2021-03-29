@@ -1,4 +1,59 @@
-from scipy.stats import loguniform
+from scipy.stats import loguniform, uniform
+def uniform_prior(Ndata=2_500, left=[0.002,0.002,0.002], right=[2,2,2]):
+    """
+    generates random samples from the uniform prior, for 3 parameters.
+    param:
+              Ndata, number of samples
+              left, left boundary
+              right, right boundary
+    output:
+              theta, random samples of size (Ndata,3)
+
+    """
+    left = np.log(left)
+    right = np.log(right)
+    
+    # left = loc
+    # right = loc + scale
+    loc = left
+    scale = right - left
+    
+
+    k0 = uniform.rvs(loc=loc[0],scale=scale[0],size=Ndata)
+    k1 = uniform.rvs(loc=loc[1],scale=scale[1],size=Ndata)
+    k2 = uniform.rvs(loc=loc[2],scale=scale[2],size=Ndata)
+
+    theta = np.vstack((k0,k1,k2)).T
+
+    return theta
+
+def uniform_prior_dens(X, left=[0.002,0.002,0.002], right=[2,2,2]):
+    """
+    generates random samples from the uniform prior, for 3 parameters.
+    param:
+              Ndata, number of samples
+              left, left boundary
+              right, right boundary
+    output:
+              theta, random samples of size (Ndata,3)
+
+    """
+    left = np.log(left)
+    right = np.log(right)
+    
+    # left = loc
+    # right = loc + scale
+    loc = left
+    scale = right - left
+    
+
+    k0 = uniform.pdf(X[:,0], loc=loc[0],scale=scale[0])
+    k1 = uniform.pdf(X[:,1], loc=loc[1],scale=scale[1])
+    k2 = uniform.pdf(X[:,2], loc=loc[2],scale=scale[2])
+
+    theta = np.vstack((k0,k1,k2)).T
+    return np.prod(theta,axis=1)
+
 
 def loguniform_prior(Ndata=2_500, log=True):
     a0, b0 = 0.002, 2
