@@ -1,59 +1,30 @@
 from scipy.stats import loguniform, uniform
-def uniform_prior(Ndata=2_500, left=[0.002,0.002,0.002], right=[2,2,2]):
-    """
-    generates random samples from the uniform prior, for 3 parameters.
-    param:
-              Ndata, number of samples
-              left, left boundary
-              right, right boundary
-    output:
-              theta, random samples of size (Ndata,3)
 
-    """
-    left = np.log(left)
-    right = np.log(right)
+import numpy as np
+from dask import compute
+from gillespy2 import Model, Species, Reaction, Parameter, RateRule, AssignmentRule, FunctionDefinition
+from gillespy2 import VariableSSACSolver
+
+def minmax_normalize(data, min_=None, max_=None):
+    data_ = np.copy(data)
+    if min_ is None:        
+        min_ = np.min(data_)
+        min_ = np.expand_dims(min_,axis=[0,1])
     
-    # left = loc
-    # right = loc + scale
-    loc = left
-    scale = right - left
+    if max_ is None:
+        max_ = np.max(data_)
+        max_ = np.expand_dims(max_,axis=[0,1])
     
+    min_[np.where(min_ == max_)] = 0
 
-    k0 = uniform.rvs(loc=loc[0],scale=scale[0],size=Ndata)
-    k1 = uniform.rvs(loc=loc[1],scale=scale[1],size=Ndata)
-    k2 = uniform.rvs(loc=loc[2],scale=scale[2],size=Ndata)
+    return (data_ - min_) / (max_ - min_), min_, max_
 
-    theta = np.vstack((k0,k1,k2)).T
+def checkprior(theta, prior):
+    flag = prior.pdf(theta) > 0
+    print(f'inside of initial prior: {sum(flag)}')
+    print(f'out of total: {len(theta)}')
 
-    return theta
-
-def uniform_prior_dens(X, left=[0.002,0.002,0.002], right=[2,2,2]):
-    """
-    generates random samples from the uniform prior, for 3 parameters.
-    param:
-              Ndata, number of samples
-              left, left boundary
-              right, right boundary
-    output:
-              theta, random samples of size (Ndata,3)
-
-    """
-    left = np.log(left)
-    right = np.log(right)
-    
-    # left = loc
-    # right = loc + scale
-    loc = left
-    scale = right - left
-    
-
-    k0 = uniform.pdf(X[:,0], loc=loc[0],scale=scale[0])
-    k1 = uniform.pdf(X[:,1], loc=loc[1],scale=scale[1])
-    k2 = uniform.pdf(X[:,2], loc=loc[2],scale=scale[2])
-
-    theta = np.vstack((k0,k1,k2)).T
-    return np.prod(theta,axis=1)
-
+    return theta[flag,:]
 
 def loguniform_prior(Ndata=2_500, log=True):
     a0, b0 = 0.002, 2
@@ -66,10 +37,73 @@ def loguniform_prior(Ndata=2_500, log=True):
         return np.log(theta)
     return theta
 
-import numpy as np
-from dask import compute
-from gillespy2 import Model, Species, Reaction, Parameter, RateRule, AssignmentRule, FunctionDefinition
-from gillespy2 import VariableSSACSolver
+from scipy.stats import uniform
+
+class uniform_prior:
+    
+    def __init__(self, left = [0.002,0.002,0.002], right =[2,2,2]):
+        self.left = np.asarray(left)
+        self.right = np.asarray(right)
+        self.m = (self.left+self.right)/2
+        self.var = (self.right-self.left)**2/12
+        self.S = np.diag(self.var)
+    def gen(self, Ndata=2_500):
+        """
+        generates random samples from the uniform prior, for 3 parameters.
+        param:
+                  Ndata, number of samples
+                  left, left boundary
+                  right, right boundary
+        output:
+                  theta, random samples of size (Ndata,3)
+
+        """
+        print("*** USED PRIOR ***")
+        left = np.log(self.left)
+        right = np.log(self.right)
+
+        # left = loc
+        # right = loc + scale
+        loc = left
+        scale = right - left
+
+
+        k0 = uniform.rvs(loc=loc[0],scale=scale[0],size=Ndata)
+        k1 = uniform.rvs(loc=loc[1],scale=scale[1],size=Ndata)
+        k2 = uniform.rvs(loc=loc[2],scale=scale[2],size=Ndata)
+
+        theta = np.vstack((k0,k1,k2)).T
+
+        return theta
+
+    def pdf(self, X):
+        """
+        generates random samples from the uniform prior, for 3 parameters.
+        param:
+                  Ndata, number of samples
+                  left, left boundary
+                  right, right boundary
+        output:
+                  theta, random samples of size (Ndata,3)
+
+        """
+        left = np.log(self.left)
+        right = np.log(self.right)
+
+        # left = loc
+        # right = loc + scale
+        loc = left
+        scale = right - left
+
+
+        k0 = uniform.pdf(X[:,0], loc=loc[0],scale=scale[0])
+        k1 = uniform.pdf(X[:,1], loc=loc[1],scale=scale[1])
+        k2 = uniform.pdf(X[:,2], loc=loc[2],scale=scale[2])
+
+        theta = np.vstack((k0,k1,k2)).T
+        return np.prod(theta,axis=1)
+
+
 
 def simulator(params, model, compiled_solver, toexp = True, transform = True):
     parameter_names = ['k1', 'k2', 'k3']
